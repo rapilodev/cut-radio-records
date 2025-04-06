@@ -1,0 +1,319 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use Config::Tiny;
+use Const::Fast;
+use DateTime                  ();
+use File::Basename            qw(dirname basename);
+use Getopt::Long;
+use JSON();
+use LWP::Simple               qw(get mirror);
+use Term::ANSIColor           qw(:constants);
+$Term::ANSIColor::AUTORESET = 1;
+
+binmode(STDOUT, ':utf8');
+sub now {
+    my $dt = DateTime->now(time_zone => 'local');
+    return $dt->strftime('%Y-%m-%d %H:%M:%S');
+}
+sub warning {print STDERR now() . YELLOW " WARN: $_[0]\n"; return;}
+sub info    {print STDERR now() . GREEN " INFO: $_[0]\n";  return;}
+sub error   {print STDERR now() . RED " ERROR: $_[0]\n";   exit 1;}
+
+const my $UNIT => {DAY => 86400, HOUR => 3600, MINUTE => 60, SEC => 1};
+const my $date_sep => q{[ T]};
+const my $time_sep => q{[\:\_\-]};
+const my $date_reg => qr{(\d\d\d\d\-\d\d\-\d\d)};
+const my $time_reg => qr{(\d\d$time_sep\d\d$time_sep\d\d)};
+const my $dt_reg =>
+  qr{(\d\d\d\d\-\d\d\-\d\d$date_sep\d\d$time_sep\d\d$time_sep\d\d)};
+
+execute('which', $_) for (qw(eyeD3 lame sox mp3gain qwavheaderdump));
+
+my $config_file;
+my $mode;
+GetOptions(
+    'config=s' => \$config_file,
+    'mode=s' => \$mode
+);
+error("Usage: $0 --config <config_file> [<DATE>|<EVENT_ID]>\n") unless $config_file;
+
+my $config = Config::Tiny->read($config_file)
+  or error("Failed to read config: $Config::Tiny::errstr");
+$config = $config->{'_'};
+for my $key (qw(events_url images_url source_dir target_dir image_target_dir timezone offset)) {
+    defined $config->{$key} or error("Missing required configuration key: '$key' in $config_file");
+}
+mkdir $config->{image_target_dir} unless -d $config->{image_target_dir};
+
+my $script_name = basename($0); # Get script name dynamically
+my $usage = qq{
+Usage: $script_name --config <config_file> [--force] <target>
+
+Processes recorded radio broadcasts (WAV) into tagged MP3 files for a specific
+date or event ID, based on settings in <config_file>.
+
+Arguments:
+  <target>        Required. Date (YYYY-MM-DD) or numeric Event ID to process.
+
+Options:
+  --config <file> Required. Path to configuration file.
+  --force         Optional. Overwrite existing output files. Default: skip.
+
+Examples:
+  # Process date 2025-04-06
+  $script_name --config settings.conf 2025-04-06
+
+  # Force process event 12345
+  $script_name --config settings.conf --force 12345
+};
+
+sub execute {
+    my @cmd = @_;
+    print STDERR now() . " EXEC:\t" . join(" ", map {"'$_'"} @cmd) . "\n";
+    system @cmd and error("exitCode=$?, $@");
+}
+
+sub get_datetime {
+    my ($datetime) = @_;
+    $datetime =~ /(\d{4})\-(\d+)\-(\d+)[T\s](\d+)[\:\_\-](\d+)(?:[\:\_\-](\d+))/
+      or error("invalid datetime format $datetime");
+    my $dt = DateTime->new(
+        year      => $1,
+        month     => $2,
+        day       => $3,
+        hour      => $4,
+        minute    => $5,
+        second    => $6,
+        time_zone => $config->{timezone}
+    );
+    return $dt;
+}
+
+sub format_duration {
+    my ($t) = @_;
+    my %d;
+    for my $u (qw(DAY HOUR MINUTE SEC)) {
+        $d{$u} = int($t / $UNIT->{$u});
+        $t -= $d{$u} * $UNIT->{$u};
+    }
+    return
+      ($d{DAY} ? "$d{DAY}d " : '') .
+      sprintf("%02d:%02d:%02d", @d{qw(HOUR MINUTE SEC)}) .
+      ($t ? sprintf(".%03d", int($t * 1000)) : '');
+}
+
+sub escape_filename {
+    my $s = shift;
+    $s =~ s/[\/\<\>\$\|\'\"\'\*]//g;
+    $s =~ s/\s+/ /g;
+    return $s;
+}
+
+sub escape_tag {
+    my $u = shift;
+    $u =~ s/\'/ /g;
+    return $u;
+}
+
+sub print_duration {
+    my $filename = shift;
+    for my $flag ('', '-F') {
+        my $wavHeader = qx{qwavheaderdump $flag '$filename' 2>&1};
+        if ($wavHeader =~ /bytes\/second: (\d+).*data length: ([\-\d]+)/) {
+            my ($bps, $length) = ($1, $2);
+            next unless defined $bps && defined $length;
+            info "Duration: $length seconds = "
+              . format_duration($length / $bps)
+              . "'$filename'";
+            return;
+        }
+    }
+}
+
+sub get_json {
+    my $url = shift;
+    info($url);
+    return JSON::decode_json LWP::Simple::get($url);
+}
+
+sub get_filename {
+    my ($event) = @_;
+    my $start = get_datetime($event->{start_datetime});
+    return $config->{target_dir} . escape_filename(
+        sprintf("%s %02d_%02d-%s.wav",
+        $start->ymd('-'), $start->hour, $start->minute, $event->{full_title})
+    );
+}
+
+sub get_output_filename {
+    my ($event, $filename) = @_;
+    return "" unless $filename;
+    return sprintf("%s/%s/%s.wav", 
+        $config->{target_dir}, $event->{start_date}, basename($filename) =~ s/\.wav//gr
+    );
+}
+
+sub get_files {
+    my ($event) = @_;
+    info("Scanning for files in the directory: '$config->{source_dir}'");
+    my $start = get_datetime($event->{start_datetime})->add(seconds => $config->{offset});
+    my $end   = get_datetime($event->{end_datetime})->add(seconds => $config->{offset});
+    my $startDate = $start->ymd('-');
+    my $endDate   = $end->ymd('-');
+    my @files     = ();
+    for my $file (
+        sort(glob("$config->{source_dir}/$startDate/*.wav"),
+            ($startDate eq $endDate ? () : glob("$config->{source_dir}/$endDate/*.wav")))
+      )
+    {
+        my ($date, $time) = $file =~ /$date_reg$date_sep$time_reg/;
+        next unless $date && $time;
+        $time =~ s/$time_sep/:/g;
+        if ($date le $start->ymd('-') && $time le $start->hms(':')) {
+            @files = ($file);
+        } elsif (($date ge $start->ymd('-')) && ($time lt $end->hms(':'))) {
+            push @files, $file;
+        }
+    }
+    print_duration($_) for @files;
+    return @files;
+}
+
+sub merge_and_cut {
+    my ($event, $filename) = @_;
+
+    my @files = get_files($event) or error("No files found");
+    if (-e $filename && $mode eq 'force') {
+        info("Remove existing WAV file '$filename' due to 'force' mode");
+        unlink $filename;
+    }
+
+    if (-e $filename) {
+        info("Skip merge: WAV file '$filename' already exists.");
+        return;
+    }
+
+    info("Merge and cut WAV files into '$filename'");
+    my $start    = get_datetime($event->{start_datetime});
+    my $end      = get_datetime($event->{end_datetime});
+    my $duration = $end->epoch - $start->epoch;
+    if ($config->{offset}){
+    $start->add(seconds => $config->{offset}) ;
+    $end->add(seconds => $config->{offset})   ;
+    }
+    my $start_cut_secs =
+      $start->minute * $UNIT->{MINUTE} + $start->second * $UNIT->{SEC};
+    my $end_cut_secs = $start_cut_secs + $duration;
+    info(   "Cut merged audio from "
+          . format_duration($start_cut_secs) . " to "
+          . format_duration($end_cut_secs));
+
+    my @cmd = ('sox');
+    push @cmd, map {('-t', 'wav', $_)} @files;
+    push @cmd, '-t',   'wav',           "$filename.cut";
+    push @cmd, 'trim', $start_cut_secs, $duration;
+    execute(@cmd);
+    execute("mv", "$filename.cut", $filename) if -e $filename . ".cut";
+    print_duration($filename);
+}
+
+sub encode_file {
+    my ($input, $output, $event) = @_;
+    return info("Skip encoding: '$output' already exists.") if -e $output;
+    mkdir dirname($output) unless -e dirname($output);
+
+    info("Encode MP3 using LAME");
+    $event->{image} = $config->{image_target_dir} . (basename $event->{image});
+    my $title = substr($event->{start_datetime}, 0, 16);
+    $title =~ s/T/ /g;
+    $title .= ' - ' . $event->{series_name} if ($event->{series_name} ne '');
+    $title .= ' - ' . $event->{title}       if ($event->{title} ne '');
+    $title .= ' #' . $event->{episode}
+      if (($event->{episode} ne '') && ($event->{title} !~ /#/));
+    my $year           = substr($event->{start_datetime}, 0, 4);
+    my $mappedLocation = $event->{location_mapped};
+
+    my @cmd = ('lame');
+    push @cmd, '-h';
+    push @cmd, '-b', 256;
+    push @cmd, '--cbr';
+    push @cmd, '--ogginput' if $input =~ /\.ogg/;
+    push @cmd, '--mp3input' if $input =~ /\.mp3/;
+    push @cmd, "--silent";
+    push @cmd, $input;
+    push @cmd, $output;
+    execute(@cmd);
+
+    info("Set ID3v2 metadata tags using eyeD3");
+    my $image = get_image($event->{image});
+    @cmd = ("eyeD3");
+    push @cmd, "--encoding=utf8";
+    push @cmd, "--title",     $title;
+    push @cmd, "--artist",    $mappedLocation;
+    push @cmd, "--album",     "Radioarchive: " . $mappedLocation . " " . $year;
+    push @cmd, "--publisher", $mappedLocation;
+    push @cmd, "--genre",     'Radioarchive';
+    push @cmd, "--track",     $event->{event_id};
+    push @cmd, "--release-year", $year;
+    push @cmd, "--comment",      ":Content:" . $event->{excerpt} =~ s/\:/ /gr;
+    push @cmd, "--add-image",    "$image:ICON" if -e $image;
+    push @cmd, $output;
+    execute(@cmd);
+    info("Apply MP3Gain to adjust the volume normalization for '$output'.");
+    execute(qw(mp3gain -q -p -r -s r -k ), $output);
+}
+
+sub get_image {
+    my $url = shift;
+    $url =~ s!^(.*?//[^/]+)/!/!g;
+    $url = $config->{images_url} . $url unless $url =~ /^http/;
+    my $filename = $config->{image_target_dir} . basename $url;
+    LWP::Simple::mirror($url, $filename);
+    return $filename;
+}
+
+sub print_event {
+    my $event = shift;
+    print STDERR GREEN qq{
+weekday        $event->{'weekday_short_name'}
+start          $event->{'start_datetime'}
+end            $event->{'end_datetime'}
+id             $event->{'event_id'}
+series/title   $event->{'full_title'}
+project        $event->{'project_title'}
+location       $event->{'location_mapped'}
+excerpt        $event->{'excerpt'}
+image-url      $event->{'image'}
+
+};
+}
+
+my $events;
+if (($ARGV[0]//'') =~ /^$date_reg$/) {
+    $events = get_json(
+        $config->{events_url} . "&from_date=$1&from_time=00:00&till_date=$1&till_time=23:59&phase=all&json=1"
+    )->{events};
+} elsif (($ARGV[0]//'') =~ /^(\d+)$/) {
+    $events = get_json($config->{events_url} . "&event_id=$1&json=1")->{events};
+} else {
+    error("Missing DATE or EVENT_ID");
+}
+
+for my $event (@$events) {
+    print_event($event);
+    info("Process event starting at $event->{start_datetime}: '$event->{full_title}'");
+    my $now = DateTime->now->set_time_zone($config->{timezone});
+    my $start = get_datetime($event->{start_datetime});
+    return info("Skip event: show has not started yet.") if $now < $start;
+    my $end = get_datetime($event->{end_datetime});
+    return info("Skip event: show is still ongoing.") if $now < $end;
+    my $filename = get_filename($event) or error("Skip event: No filename found.");
+    my $outputFile = get_output_filename($event, $filename);
+    return info("Skip event: Output file '$outputFile' already exists.")
+      if -e $outputFile;
+    merge_and_cut($event, $filename);
+    unlink $outputFile if -e $outputFile && $mode eq 'force';
+    encode_file($filename, $outputFile, $event);
+}

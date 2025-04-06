@@ -1,0 +1,45 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use DateTime;
+
+my $dow = DateTime->today->day_of_week;
+my %day = (
+    monday    => 1,
+    tuesday   => 2,
+    wednesday => 3,
+    thursday  => 4,
+    friday    => 5,
+    saturday  => 6,
+    sunday    => 7,
+);
+
+my $arg = lc($ARGV[0] // '');
+if ($arg =~ /(\d{4}-\d{2}-\d{2})/) {
+    my $date = $1;
+    print "Processing $date\n";
+    my @cmd = ("perl", "postProcess.pl", $date);
+    print "EXEC: @cmd\n";
+    system(@cmd) or die $!;
+} elsif (exists $day{$arg}) {
+    copy($day{$arg});
+} elsif ($dow == $day{thursday}) {
+    copy($day{wednesday});
+    copy($day{thursday});
+} elsif ($dow == $day{friday}) {
+    copy($day{thursday});
+    copy($day{friday});
+} elsif ($dow == $day{saturday}) {
+    copy($day{friday});
+}
+
+sub copy {
+    my $dow  = shift;
+    my $date = DateTime->today;
+    $date->subtract(days => ($date->day_of_week - $dow) % 7);
+    print "Processing " . $date->ymd . "\n";
+    my @cmd = ("perl", "postProcess.pl", $date->ymd);
+    print "EXEC: @cmd\n";
+    system(@cmd) or die $!;
+}
